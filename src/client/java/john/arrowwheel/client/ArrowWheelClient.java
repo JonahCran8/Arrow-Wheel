@@ -1,11 +1,11 @@
 package john.arrowwheel.client;
 
 import com.mojang.blaze3d.platform.InputConstants;
-import john.arrowwheel.AmmoGroups;
-import john.arrowwheel.ArrowWheel;
+import john.arrowwheel.*;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements;
 import net.minecraft.client.DeltaTracker;
@@ -18,6 +18,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 import net.minecraft.tags.TagKey;
 import net.minecraft.util.Mth;
+import net.minecraft.util.Util;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import org.joml.Matrix3x2fStack;
@@ -34,8 +35,24 @@ public class ArrowWheelClient implements ClientModInitializer {
 	private static final Identifier HOTBAR_TEXTURE =
 			Identifier.withDefaultNamespace("textures/gui/sprites/hud/hotbar.png");
 	private static final float SCALE = 2f / 3f;
-	private static final int BOTTOM_MARGIN = 24;
+	private static final int BOTTOM_MARGIN = 26;
 	private static final int MAX_SLOTS = 9;
+	private static boolean rHeld = false;
+	private static long rPressedAt = 0;
+	private static final long HOLD_MS = 250;
+	private static boolean wasDown = false;
+
+	private static void commitSelection(Minecraft client) {
+		TagKey<Item> tag = currentAmmoTag(client);
+		if (tag != null && client.player != null) {
+			List<ItemStack> ammo = AmmoGroups.collectAmmo(client.player, tag);
+			if (!ammo.isEmpty()) {
+				ItemStack chosen = ammo.get(Math.min(selectedIndex, ammo.size() - 1));
+				ClientPlayNetworking.send(new SelectAmmoPayload(chosen.copyWithCount(1)));
+			}
+		}
+		popupOpen = false;
+	}
 
 	// The ammo tag for whatever is in the main hand, or null if it isn't a wheel weapon
 	private static TagKey<Item> currentAmmoTag(Minecraft client) {
@@ -72,25 +89,72 @@ public class ArrowWheelClient implements ClientModInitializer {
 		ClientTickEvents.END_CLIENT_TICK.register(client -> {
 			if (client.player == null) {
 				popupOpen = false;
+				rHeld = false;
+				wasDown = false;
 				return;
 			}
 
 			boolean holdingWeapon = currentAmmoTag(client) != null;
 
-			while (arrowWheel.consumeClick()) {
-				if (holdingWeapon) {
-					popupOpen = !popupOpen;
-				}
-			}
+			while (arrowWheel.consumeClick()) { }
+
+			boolean down = arrowWheel.isDown();
+			boolean pressed = down && !wasDown;
+			boolean released = !down && wasDown;
+			wasDown = down;
 
 			if (!holdingWeapon) {
 				popupOpen = false;
+				rHeld = false;
+				return;
+			}
+
+			if (pressed) {
+				if (popupOpen) {
+					commitSelection(client);        // tap while open: confirm and close
+				} else {
+					popupOpen = true;               // open, and start timing the press
+					rHeld = true;
+					rPressedAt = Util.getMillis();
+
+					popupOpen = true;
+					rHeld = true;
+					rPressedAt = Util.getMillis();
+
+					SelectedAmmo sel = client.player.getMainHandItem().get(ModComponents.SELECTED_AMMO);
+					TagKey<Item> tag = currentAmmoTag(client);
+					if (sel != null && tag != null) {
+						List<ItemStack> ammo = AmmoGroups.collectAmmo(client.player, tag);
+						for (int i = 0; i < ammo.size(); i++) {
+							if (ItemStack.isSameItemSameComponents(ammo.get(i), sel.ammo())) {
+								selectedIndex = i;
+								break;
+							}
+						}
+					}
+				}
+			}
+
+			if (released && rHeld) {
+				rHeld = false;
+				if (popupOpen && Util.getMillis() - rPressedAt >= HOLD_MS) {
+					commitSelection(client);        // long hold released: confirm and close
+				}                                   // short tap released: leave it open
+			}
+		});
+
+		ClientTickEvents.START_CLIENT_TICK.register(client -> {
+			if (popupOpen && client.gui.screen() == null && client.options.keyUse.isDown()) {
+				commitSelection(client);   // popup closes; vanilla then handles the click and starts the draw
 			}
 		});
 
 		HudElementRegistry.attachElementAfter(
 				VanillaHudElements.HOTBAR, ArrowWheel.id("arrow_popup"),
 				ArrowWheelClient::render);
+		HudElementRegistry.attachElementAfter(
+				VanillaHudElements.HOTBAR, ArrowWheel.id("ammo_corner"),
+				ArrowWheelClient::renderCorner);
 	}
 
 	private static void render(GuiGraphicsExtractor graphics, DeltaTracker delta) {
@@ -159,6 +223,31 @@ public class ArrowWheelClient implements ClientModInitializer {
 		int textX = Mth.clamp((int) (slotCenterX - textW / 2f), 2, screenW - textW - 2);
 		int textY = (int) y - 12;
 		graphics.text(client.font, name, textX, textY, 0xFFFFFFFF, true);
+	}
+
+	private static void renderCorner(GuiGraphicsExtractor graphics, DeltaTracker delta) {
+		Minecraft client = Minecraft.getInstance();
+		LocalPlayer player = client.player;
+		if (player == null) return;
+
+		int screenW = client.getWindow().getGuiScaledWidth();
+		int screenH = client.getWindow().getGuiScaledHeight();
+		Matrix3x2fStack pose = graphics.pose();
+
+		for (int slot = 0; slot < 9; slot++) {
+			ItemStack weapon = player.getInventory().getItem(slot);
+			SelectedAmmo sel = weapon.get(ModComponents.SELECTED_AMMO);
+			if (sel == null) continue;
+
+			int slotX = screenW / 2 - 88 + 20 * slot;
+			int slotY = screenH - 19;
+
+			pose.pushMatrix();
+			pose.translate(slotX + 8, slotY + 8);
+			pose.scale(0.5f, 0.5f);
+			graphics.item(sel.ammo(), 0, 0);
+			pose.popMatrix();
+		}
 	}
 
 }

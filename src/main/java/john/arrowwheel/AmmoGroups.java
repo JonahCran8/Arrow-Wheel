@@ -47,4 +47,20 @@ public class AmmoGroups {
         }
         return types;
     }
+
+    public static ItemStack findSelectedAmmo(Player player, ItemStack weapon) {
+        SelectedAmmo sel = weapon.get(ModComponents.SELECTED_AMMO);
+        if (sel == null) return null;
+        TagKey<Item> tag = findAmmoTag(player, weapon);
+        if (tag == null) return null;
+
+        Inventory inv = player.getInventory();
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            ItemStack s = inv.getItem(i);
+            if (!s.isEmpty() && s.is(tag) && ItemStack.isSameItemSameComponents(s, sel.ammo())) {
+                return s;   // the real inventory stack, not a copy
+            }
+        }
+        return null;        // ran out: fall back to vanilla's own search
+    }
 }
