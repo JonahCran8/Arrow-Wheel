@@ -1,6 +1,7 @@
 package john.arrowwheel.client;
 
 import com.mojang.blaze3d.platform.InputConstants;
+import john.arrowwheel.AmmoGroups;
 import john.arrowwheel.ArrowWheel;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -13,15 +14,13 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.client.renderer.RenderPipelines;
+import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
-import net.minecraft.tags.ItemTags;
+import net.minecraft.tags.TagKey;
 import net.minecraft.util.Mth;
-import net.minecraft.world.entity.player.Inventory;
-import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.Items;
 import org.joml.Matrix3x2fStack;
-import java.util.ArrayList;
 import java.util.List;
 import static net.minecraft.client.KeyMapping.Category.INVENTORY;
 
@@ -29,36 +28,38 @@ public class ArrowWheelClient implements ClientModInitializer {
 
 	private static boolean popupOpen = false;
 	private static KeyMapping arrowWheel;
+	private static int selectedIndex = 0;
+	private static final Identifier SELECTION_TEXTURE =
+			Identifier.withDefaultNamespace("textures/gui/sprites/hud/hotbar_selection.png");
 	private static final Identifier HOTBAR_TEXTURE =
 			Identifier.withDefaultNamespace("textures/gui/sprites/hud/hotbar.png");
 	private static final float SCALE = 2f / 3f;
 	private static final int BOTTOM_MARGIN = 24;
 	private static final int MAX_SLOTS = 9;
 
-	// Create a list of held arrows
-	private static List<ItemStack> collectArrows(Player player) {
-		List<ItemStack> types = new ArrayList<>();
-		Inventory inv = player.getInventory();
-		for (int i = 0; i < inv.getContainerSize(); i++) {
-			ItemStack stack = inv.getItem(i);
-			if (stack.isEmpty() || !stack.is(ItemTags.ARROWS)) continue;
+	// The ammo tag for whatever is in the main hand, or null if it isn't a wheel weapon
+	private static TagKey<Item> currentAmmoTag(Minecraft client) {
+		if (client.player == null) return null;
+		return AmmoGroups.findAmmoTag(client.player, client.player.getMainHandItem());
+	}
 
-			boolean merged = false;
-			for (ItemStack existing : types) {
-				if (ItemStack.isSameItemSameComponents(existing, stack)) {
-					existing.grow(stack.getCount());
-					merged = true;
-					break;
-				}
-			}
-			if (!merged) types.add(stack.copy());
-		}
-		return types;
+	public static boolean handleScroll(double yOffset) {
+		Minecraft client = Minecraft.getInstance();
+		if (!popupOpen || client.gui.screen() != null || client.player == null) return false;
+
+		TagKey<Item> ammoTag = currentAmmoTag(client);
+		if (ammoTag == null) return false;
+
+		int count = Math.min(AmmoGroups.collectAmmo(client.player, ammoTag).size(), MAX_SLOTS);
+		if (count == 0) return false;
+
+		int dir = yOffset > 0 ? -1 : 1;
+		selectedIndex = Math.floorMod(selectedIndex + dir, count);
+		return true;
 	}
 
 	@Override
 	public void onInitializeClient() {
-		System.out.println("ArrowWheelClient loaded");
 		arrowWheel = KeyMappingHelper.registerKeyMapping(
 				new KeyMapping(
 						"key.arrowwheel.open_wheel",
@@ -68,22 +69,21 @@ public class ArrowWheelClient implements ClientModInitializer {
 				)
 		);
 
-		// Check button press
 		ClientTickEvents.END_CLIENT_TICK.register(client -> {
 			if (client.player == null) {
 				popupOpen = false;
 				return;
 			}
 
-			boolean holdingBow = client.player.getMainHandItem().is(Items.BOW);
+			boolean holdingWeapon = currentAmmoTag(client) != null;
 
 			while (arrowWheel.consumeClick()) {
-				if (holdingBow) {
+				if (holdingWeapon) {
 					popupOpen = !popupOpen;
 				}
 			}
 
-			if (!holdingBow) {
+			if (!holdingWeapon) {
 				popupOpen = false;
 			}
 		});
@@ -95,22 +95,26 @@ public class ArrowWheelClient implements ClientModInitializer {
 
 	private static void render(GuiGraphicsExtractor graphics, DeltaTracker delta) {
 		if (!popupOpen) return;
+
 		Minecraft client = Minecraft.getInstance();
 		LocalPlayer player = client.player;
-		if (player == null || !player.getMainHandItem().is(Items.BOW)) return;
+		if (player == null) return;
 
-		List<ItemStack> arrows = collectArrows(player);
-		int slots = Math.min(arrows.size(), MAX_SLOTS);
+		TagKey<Item> ammoTag = AmmoGroups.findAmmoTag(player, player.getMainHandItem());
+		if (ammoTag == null) return;   // not holding a wheel weapon
+
+		List<ItemStack> ammo = AmmoGroups.collectAmmo(player, ammoTag);
+		int slots = Math.min(ammo.size(), MAX_SLOTS);
 		if (slots == 0) return;
 
 		int screenW = client.getWindow().getGuiScaledWidth();
 		int screenH = client.getWindow().getGuiScaledHeight();
 
-		int barW = slots * 20 + 2;            // width of an N-slot hotbar, unscaled
+		int barW = slots * 20 + 2;
 		float scaledW = barW * SCALE;
 		float scaledH = 22 * SCALE;
 
-		// centre of the bow's slot in the vanilla hotbar
+		// centre of the weapon's slot in the vanilla hotbar
 		float centerX = screenW / 2f - 80 + 20 * player.getInventory().getSelectedSlot();
 		float x = Mth.clamp(centerX - scaledW / 2f, 2, screenW - scaledW - 2);
 		float y = screenH - BOTTOM_MARGIN - scaledH;
@@ -120,14 +124,18 @@ public class ArrowWheelClient implements ClientModInitializer {
 		pose.translate(x, y);
 		pose.scale(SCALE, SCALE);
 
-		// background: left part of the vanilla texture, then its 1px right edge
 		graphics.blit(RenderPipelines.GUI_TEXTURED, HOTBAR_TEXTURE,
 				0, 0, 0, 0, barW - 1, 22, barW - 1, 22, 182, 22);
 		graphics.blit(RenderPipelines.GUI_TEXTURED, HOTBAR_TEXTURE,
 				barW - 1, 0, 181, 0, 1, 22, 1, 22, 182, 22);
 
+		selectedIndex = Math.min(selectedIndex, slots - 1);
+
+		graphics.blit(RenderPipelines.GUI_TEXTURED, SELECTION_TEXTURE,
+				-1 + 20 * selectedIndex, -1, 0, 0, 24, 24, 24, 24, 24, 24);
+
 		for (int i = 0; i < slots; i++) {
-			ItemStack stack = arrows.get(i);
+			ItemStack stack = ammo.get(i);
 			int itemX = 3 + i * 20;
 			int itemY = 3;
 			graphics.item(stack, itemX, itemY);
@@ -142,6 +150,15 @@ public class ArrowWheelClient implements ClientModInitializer {
 		}
 
 		pose.popMatrix();
+
+		ItemStack selected = ammo.get(selectedIndex);
+		Component name = selected.getHoverName();
+		int textW = client.font.width(name);
+
+		float slotCenterX = x + (11 + 20 * selectedIndex) * SCALE;
+		int textX = Mth.clamp((int) (slotCenterX - textW / 2f), 2, screenW - textW - 2);
+		int textY = (int) y - 12;
+		graphics.text(client.font, name, textX, textY, 0xFFFFFFFF, true);
 	}
 
 }
